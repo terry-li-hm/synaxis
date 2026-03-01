@@ -216,7 +216,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("Usage: necto [--full] [--check]");
+        println!("Usage: synaxis [--full] [--check]");
         println!();
         println!("  (default)  Sync skills symlinks (fast, safe for git hooks)");
         println!("  --full     Skills + MCP + compound-engineering");

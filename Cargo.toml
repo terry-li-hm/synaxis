@@ -1,15 +1,15 @@
 [package]
-name = "necto"
-version = "0.2.0"
+name = "synaxis"
+version = "0.1.0"
 edition = "2024"
-description = "Sync AI coding tool config across Claude Code, OpenCode, Codex, and Gemini CLI — skills, MCP, and compound-engineering from a single source of truth"
+description = "Sync AI coding tool config across Claude Code, OpenCode, Codex, and Gemini CLI — config-driven, single source of truth"
 license = "MIT"
-repository = "https://github.com/terry-li-hm/necto"
+repository = "https://github.com/terry-li-hm/synaxis"
 keywords = ["cli", "ai", "sync", "mcp", "claude"]
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
-name = "necto"
+name = "synaxis"
 path = "src/main.rs"
 
 [dependencies]
