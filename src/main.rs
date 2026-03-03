@@ -244,8 +244,15 @@ fn sync_skills(home: &Path, config: &Config, dry_run: bool) -> usize {
             continue;
         }
         if item.is_dir() && item.join("SKILL.md").exists() {
+            let has_frontmatter = fs::read_to_string(item.join("SKILL.md"))
+                .map(|c| c.starts_with("---"))
+                .unwrap_or(false);
+            if !has_frontmatter {
+                eprintln!("⚠  Skills: {}/SKILL.md missing YAML frontmatter", name);
+            }
             if dry_run {
-                println!("  {}", name);
+                let flag = if has_frontmatter { "" } else { "  ⚠ no frontmatter" };
+                println!("  {}{}", name, flag);
             } else {
                 for t in &targets {
                     let dest = t.join(name.as_ref());
