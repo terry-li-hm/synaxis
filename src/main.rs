@@ -232,7 +232,13 @@ fn sync_skills(home: &Path, config: &Config, dry_run: bool) -> usize {
 
     let mut count = 0;
     let mut entries: Vec<_> = fs::read_dir(&skills_dir)
-        .expect("cannot read ~/skills/")
+        .unwrap_or_else(|err| {
+            panic!(
+                "cannot read skills source {} ({})",
+                skills_dir.display(),
+                err
+            )
+        })
         .flatten()
         .collect();
     entries.sort_by_key(|e| e.file_name());
@@ -251,7 +257,11 @@ fn sync_skills(home: &Path, config: &Config, dry_run: bool) -> usize {
                 eprintln!("⚠  Skills: {}/SKILL.md missing YAML frontmatter", name);
             }
             if dry_run {
-                let flag = if has_frontmatter { "" } else { "  ⚠ no frontmatter" };
+                let flag = if has_frontmatter {
+                    ""
+                } else {
+                    "  ⚠ no frontmatter"
+                };
                 println!("  {}{}", name, flag);
             } else {
                 for t in &targets {
@@ -432,7 +442,7 @@ fn main() {
     let config = load_config();
 
     if check {
-        println!("Skills in ~/skills/:");
+        println!("Skills in {}:", skills_source(&config, &home).display());
         let count = sync_skills(&home, &config, true);
         println!("{} skills", count);
         exit(0);
