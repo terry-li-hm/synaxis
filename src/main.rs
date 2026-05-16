@@ -214,11 +214,33 @@ fn sync_skills(home: &Path, config: &Config, dry_run: bool) -> usize {
     let targets = targets(config, home);
     let skip = skip_entries(config);
 
+    let mut active_targets = Vec::new();
     if !dry_run {
         for t in &targets {
-            fs::create_dir_all(t).ok();
+            if t == &skills_dir {
+                eprintln!(
+                    "⚠  Skills: target {} is the source directory; skipping",
+                    t.display()
+                );
+                continue;
+            }
+            if t.is_symlink() {
+                if let Err(err) = fs::remove_file(t) {
+                    eprintln!(
+                        "⚠  Skills: cannot replace target symlink {} ({})",
+                        t.display(),
+                        err
+                    );
+                    continue;
+                }
+            }
+            if let Err(err) = fs::create_dir_all(t) {
+                eprintln!("⚠  Skills: cannot create target {} ({})", t.display(), err);
+                continue;
+            }
+            active_targets.push(t.clone());
         }
-        for t in &targets {
+        for t in &active_targets {
             if let Ok(entries) = fs::read_dir(t) {
                 for entry in entries.flatten() {
                     let path = entry.path();
@@ -264,12 +286,23 @@ fn sync_skills(home: &Path, config: &Config, dry_run: bool) -> usize {
                 };
                 println!("  {}{}", name, flag);
             } else {
-                for t in &targets {
+                for t in &active_targets {
                     let dest = t.join(name.as_ref());
                     if dest.is_symlink() || dest.exists() {
-                        fs::remove_file(&dest).ok();
+                        if dest.is_dir() && !dest.is_symlink() {
+                            fs::remove_dir_all(&dest).ok();
+                        } else {
+                            fs::remove_file(&dest).ok();
+                        }
                     }
-                    std::os::unix::fs::symlink(&item, &dest).ok();
+                    if let Err(err) = std::os::unix::fs::symlink(&item, &dest) {
+                        eprintln!(
+                            "⚠  Skills: cannot link {} -> {} ({})",
+                            dest.display(),
+                            item.display(),
+                            err
+                        );
+                    }
                 }
             }
             count += 1;
