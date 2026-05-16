@@ -268,7 +268,7 @@ fn sync_skills(home: &Path, config: &Config, dry_run: bool) -> usize {
     for entry in entries {
         let item = entry.path();
         let name = item.file_name().unwrap().to_string_lossy();
-        if skip.iter().any(|s| s == name.as_ref()) || item.is_symlink() {
+        if skip.iter().any(|s| s == name.as_ref()) {
             continue;
         }
         if item.is_dir() && item.join("SKILL.md").exists() {
