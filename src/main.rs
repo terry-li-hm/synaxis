@@ -405,7 +405,13 @@ fn replace_or_append_managed_block(existing: &str, block: &str) -> Result<String
         out.push_str(&rest[..start]);
         let block_start = &rest[start..];
         if let Some(end_rel) = block_start.find(MCP_END) {
-            let end = start + end_rel + MCP_END.len();
+            let mut end = start + end_rel + MCP_END.len();
+            // The managed `block` carries its own trailing newline, so consume a
+            // single newline following MCP_END here; otherwise it survives as
+            // leftover and a blank line accumulates on every run (non-idempotent).
+            if rest[end..].starts_with('\n') {
+                end += 1;
+            }
             if !inserted {
                 out.push_str(block);
                 inserted = true;
@@ -562,6 +568,17 @@ mod tests {
         assert!(result.contains("middle"));
         assert!(!result.contains("old1"));
         assert!(!result.contains("old2"));
+    }
+
+    #[test]
+    fn test_replace_or_append_managed_block_is_idempotent() {
+        // Steady state: config.toml already ends with the managed block. Running
+        // synaxis again must reproduce the file byte-for-byte, not accumulate a
+        // trailing blank line on every run.
+        let block = format!("{}\nnew\n{}\n", MCP_BEGIN, MCP_END);
+        let once = replace_or_append_managed_block("model = \"gpt-5\"\n", &block).unwrap();
+        let twice = replace_or_append_managed_block(&once, &block).unwrap();
+        assert_eq!(once, twice, "re-applying the managed block must be a no-op");
     }
 
     #[test]
