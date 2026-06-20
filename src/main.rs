@@ -397,18 +397,30 @@ fn build_codex_mcp_block(codex_extras: &BTreeMap<String, CodexExtra>) -> String 
 }
 
 fn replace_or_append_managed_block(existing: &str, block: &str) -> Result<String, &'static str> {
-    if let Some(start) = existing.find(MCP_BEGIN) {
-        if let Some(end_rel) = existing[start..].find(MCP_END) {
+    let mut out = String::new();
+    let mut rest = existing;
+    let mut inserted = false;
+
+    while let Some(start) = rest.find(MCP_BEGIN) {
+        out.push_str(&rest[..start]);
+        let block_start = &rest[start..];
+        if let Some(end_rel) = block_start.find(MCP_END) {
             let end = start + end_rel + MCP_END.len();
-            let mut out = String::new();
-            out.push_str(&existing[..start]);
-            out.push_str(block);
-            out.push_str(&existing[end..]);
-            return Ok(out);
+            if !inserted {
+                out.push_str(block);
+                inserted = true;
+            }
+            rest = &rest[end..];
+        } else {
+            return Err(
+                "found '# synaxis-mcp-begin' without matching '# synaxis-mcp-end'; leaving Codex config unchanged",
+            );
         }
-        return Err(
-            "found '# synaxis-mcp-begin' without matching '# synaxis-mcp-end'; leaving Codex config unchanged",
-        );
+    }
+
+    if inserted {
+        out.push_str(rest);
+        return Ok(out);
     }
 
     let mut out = existing.to_string();
@@ -531,6 +543,25 @@ mod tests {
         let block = format!("{}\nnew content\n{}\n", MCP_BEGIN, MCP_END);
         let result = replace_or_append_managed_block(&existing, &block).unwrap();
         assert_eq!(result, block);
+    }
+
+    #[test]
+    fn test_replace_or_append_managed_block_collapses_duplicate_blocks() {
+        // A config that accumulated two managed blocks (e.g. from a crashed run)
+        // must collapse to a single fresh block, preserving surrounding content.
+        let existing = format!(
+            "{b}\nold1\n{e}\nmiddle\n{b}\nold2\n{e}\n",
+            b = MCP_BEGIN,
+            e = MCP_END
+        );
+        let block = format!("{}\nnew\n{}\n", MCP_BEGIN, MCP_END);
+        let result = replace_or_append_managed_block(&existing, &block).unwrap();
+        assert_eq!(result.matches(MCP_BEGIN).count(), 1, "exactly one begin marker");
+        assert_eq!(result.matches(MCP_END).count(), 1, "exactly one end marker");
+        assert!(result.contains("new"));
+        assert!(result.contains("middle"));
+        assert!(!result.contains("old1"));
+        assert!(!result.contains("old2"));
     }
 
     #[test]
