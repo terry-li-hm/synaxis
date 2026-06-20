@@ -367,12 +367,27 @@ fn sync_mcp(home: &Path, config: &Config) {
     }
 }
 
+/// Render a TOML key as-is if it is a valid bare key (`[A-Za-z0-9_-]`),
+/// otherwise as a quoted basic string. Without this a server name containing a
+/// dot would be parsed as a nested table rather than a single server name.
+fn toml_key(key: &str) -> String {
+    let is_bare = !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if is_bare {
+        key.to_string()
+    } else {
+        serde_json::to_string(key).unwrap_or_else(|_| format!("\"{}\"", key))
+    }
+}
+
 fn build_codex_mcp_block(codex_extras: &BTreeMap<String, CodexExtra>) -> String {
     let mut out = String::new();
     out.push_str(MCP_BEGIN);
     out.push('\n');
     for (name, extra) in codex_extras {
-        out.push_str(&format!("[mcp_servers.{}]\n", name));
+        out.push_str(&format!("[mcp_servers.{}]\n", toml_key(name)));
         let url = serde_json::to_string(&extra.url).unwrap_or_else(|_| "\"\"".to_string());
         out.push_str(&format!("url = {}\n", url));
     }
@@ -539,6 +554,25 @@ mod tests {
         assert!(block.trim_end().ends_with(MCP_END));
         assert!(block.contains("[mcp_servers.my-server]"));
         assert!(block.contains(r#"url = "https://example.com/path?q=1&r=2""#));
+    }
+
+    #[test]
+    fn test_build_codex_mcp_block_quotes_non_bare_key() {
+        // A server name containing a dot is not a valid TOML bare key; left
+        // unquoted it would be parsed as a nested table (mcp_servers.my.server)
+        // rather than a single server named "my.server".
+        let mut extras = BTreeMap::new();
+        extras.insert(
+            "my.server".to_string(),
+            CodexExtra {
+                url: "https://example.com".to_string(),
+            },
+        );
+        let block = build_codex_mcp_block(&extras);
+        assert!(
+            block.contains(r#"[mcp_servers."my.server"]"#),
+            "non-bare key should be quoted, got: {block}"
+        );
     }
 }
 
