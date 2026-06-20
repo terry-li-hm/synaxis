@@ -434,6 +434,114 @@ fn sync_ce(home: &Path, config: &Config) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_expand_tilde_home_only() {
+        let home = PathBuf::from("/home/user");
+        assert_eq!(expand_tilde("~", &home), PathBuf::from("/home/user"));
+    }
+
+    #[test]
+    fn test_expand_tilde_home_relative() {
+        let home = PathBuf::from("/home/user");
+        assert_eq!(
+            expand_tilde("~/foo/bar", &home),
+            PathBuf::from("/home/user/foo/bar")
+        );
+    }
+
+    #[test]
+    fn test_expand_tilde_absolute_passthrough() {
+        let home = PathBuf::from("/home/user");
+        assert_eq!(
+            expand_tilde("/absolute/path", &home),
+            PathBuf::from("/absolute/path")
+        );
+    }
+
+    #[test]
+    fn test_default_targets_use_home() {
+        let home = PathBuf::from("/home/user");
+        let config = Config::default();
+        assert_eq!(
+            targets(&config, &home),
+            vec![
+                PathBuf::from("/home/user/.claude/skills"),
+                PathBuf::from("/home/user/.opencode/skills"),
+                PathBuf::from("/home/user/.codex/skills"),
+                PathBuf::from("/home/user/.agents/skills"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_default_skip_entries() {
+        let config = Config::default();
+        let expected: Vec<String> = DEFAULT_SKIP.iter().map(|s| s.to_string()).collect();
+        assert_eq!(skip_entries(&config), expected);
+    }
+
+    #[test]
+    fn test_default_ce_platforms() {
+        let config = Config::default();
+        assert_eq!(
+            ce_platforms(&config),
+            vec!["codex".to_string(), "opencode".to_string(), "gemini".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_replace_or_append_managed_block_appends_to_empty() {
+        let block = format!("{}\nsome content\n{}\n", MCP_BEGIN, MCP_END);
+        let result = replace_or_append_managed_block("", &block).unwrap();
+        assert_eq!(result, block);
+    }
+
+    #[test]
+    fn test_replace_or_append_managed_block_appends_after_existing_without_newline() {
+        let existing = "existing content";
+        let block = format!("{}\nsome content\n{}\n", MCP_BEGIN, MCP_END);
+        let result = replace_or_append_managed_block(existing, &block).unwrap();
+        assert_eq!(result, format!("existing content\n{}", block));
+    }
+
+    #[test]
+    fn test_replace_or_append_managed_block_replaces_existing() {
+        let existing = format!("{}\nold content\n{}", MCP_BEGIN, MCP_END);
+        let block = format!("{}\nnew content\n{}\n", MCP_BEGIN, MCP_END);
+        let result = replace_or_append_managed_block(&existing, &block).unwrap();
+        assert_eq!(result, block);
+    }
+
+    #[test]
+    fn test_replace_or_append_managed_block_errors_on_unclosed_begin() {
+        let existing = format!("{}\nno end marker here", MCP_BEGIN);
+        let block = format!("{}\nnew\n{}\n", MCP_BEGIN, MCP_END);
+        assert!(replace_or_append_managed_block(&existing, &block).is_err());
+    }
+
+    #[test]
+    fn test_build_codex_mcp_block_escapes_url() {
+        let mut extras = BTreeMap::new();
+        extras.insert(
+            "my-server".to_string(),
+            CodexExtra {
+                url: "https://example.com/path?q=1&r=2".to_string(),
+            },
+        );
+        let block = build_codex_mcp_block(&extras);
+        assert!(block.starts_with(MCP_BEGIN));
+        assert!(block.trim_end().ends_with(MCP_END));
+        assert!(block.contains("[mcp_servers.my-server]"));
+        assert!(block.contains(r#"url = "https://example.com/path?q=1&r=2""#));
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let home = home();
