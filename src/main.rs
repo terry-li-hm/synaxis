@@ -384,14 +384,16 @@ fn toml_key(key: &str) -> String {
 
 /// OpenCode expects `mcpServers` to be a JSON object. A source file that omits
 /// the key (tolerated by `#[serde(default)]`) or sets it to `null` deserializes
-/// to `Value::Null`; writing that through emits `"mcpServers": null`, which the
-/// consumer rejects. Normalize a null value to an empty object so a partial
-/// source still yields a valid OpenCode config.
+/// to `Value::Null`; a malformed source may also set it to an array or scalar.
+/// Writing any of these through emits e.g. `"mcpServers": null` or
+/// `"mcpServers": []`, which the consumer rejects. Normalize any non-object
+/// value to an empty object so a partial or malformed source still yields a
+/// valid OpenCode config.
 fn normalize_mcp_servers(value: serde_json::Value) -> serde_json::Value {
-    if value.is_null() {
-        serde_json::Value::Object(serde_json::Map::new())
-    } else {
+    if value.is_object() {
         value
+    } else {
+        serde_json::Value::Object(serde_json::Map::new())
     }
 }
 
@@ -619,6 +621,28 @@ mod tests {
     fn test_normalize_mcp_servers_preserves_existing_object() {
         let value = serde_json::json!({ "ctx7": { "url": "https://example.com" } });
         assert_eq!(normalize_mcp_servers(value.clone()), value);
+    }
+
+    #[test]
+    fn test_normalize_mcp_servers_non_object_becomes_empty_object() {
+        // OpenCode's `mcpServers` must be a JSON object. A source that sets it to
+        // any other shape — an empty array (a common "no servers" mistake), or a
+        // scalar from a malformed file — would otherwise be written through
+        // verbatim as e.g. `"mcpServers": []`, which OpenCode rejects. Coerce any
+        // non-object value to an empty object, just as the null case does.
+        for malformed in [
+            serde_json::json!([]),
+            serde_json::json!([{ "url": "https://example.com" }]),
+            serde_json::json!("oops"),
+            serde_json::json!(7),
+            serde_json::json!(true),
+        ] {
+            assert_eq!(
+                normalize_mcp_servers(malformed.clone()),
+                serde_json::json!({}),
+                "non-object {malformed} should normalize to empty object"
+            );
+        }
     }
 
     #[test]
