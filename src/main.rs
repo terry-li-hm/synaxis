@@ -334,7 +334,7 @@ fn sync_mcp(home: &Path, config: &Config) {
         fs::create_dir_all(parent).ok();
     }
     let opencode_body = OpenCodeMcp {
-        mcp_servers: parsed.mcp_servers.clone(),
+        mcp_servers: normalize_mcp_servers(parsed.mcp_servers.clone()),
     };
     match serde_json::to_string_pretty(&opencode_body) {
         Ok(json) => {
@@ -379,6 +379,19 @@ fn toml_key(key: &str) -> String {
         key.to_string()
     } else {
         serde_json::to_string(key).unwrap_or_else(|_| format!("\"{}\"", key))
+    }
+}
+
+/// OpenCode expects `mcpServers` to be a JSON object. A source file that omits
+/// the key (tolerated by `#[serde(default)]`) or sets it to `null` deserializes
+/// to `Value::Null`; writing that through emits `"mcpServers": null`, which the
+/// consumer rejects. Normalize a null value to an empty object so a partial
+/// source still yields a valid OpenCode config.
+fn normalize_mcp_servers(value: serde_json::Value) -> serde_json::Value {
+    if value.is_null() {
+        serde_json::Value::Object(serde_json::Map::new())
+    } else {
+        value
     }
 }
 
@@ -586,6 +599,26 @@ mod tests {
         let existing = format!("{}\nno end marker here", MCP_BEGIN);
         let block = format!("{}\nnew\n{}\n", MCP_BEGIN, MCP_END);
         assert!(replace_or_append_managed_block(&existing, &block).is_err());
+    }
+
+    #[test]
+    fn test_normalize_mcp_servers_null_becomes_empty_object() {
+        // A source missing `mcpServers` deserializes to null; writing it through
+        // would emit `"mcpServers": null`, which OpenCode rejects.
+        let normalized = normalize_mcp_servers(serde_json::Value::Null);
+        assert_eq!(normalized, serde_json::json!({}));
+        // And it serializes inside the OpenCode body as an object, not null.
+        let body = OpenCodeMcp {
+            mcp_servers: normalized,
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert_eq!(json, r#"{"mcpServers":{}}"#);
+    }
+
+    #[test]
+    fn test_normalize_mcp_servers_preserves_existing_object() {
+        let value = serde_json::json!({ "ctx7": { "url": "https://example.com" } });
+        assert_eq!(normalize_mcp_servers(value.clone()), value);
     }
 
     #[test]
