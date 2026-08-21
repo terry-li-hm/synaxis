@@ -46,8 +46,30 @@ struct Config {
 #[serde(default)]
 struct SkillsConfig {
     source: Option<String>,
-    targets: Option<Vec<String>>,
+    targets: Option<Vec<SkillTarget>>,
     skip: Option<Vec<String>>,
+}
+
+/// A `[skills].targets` entry: either a plain path string (the historical
+/// form) or an inline table carrying a path plus an optional allowlist of
+/// skill directory names. A `Detailed` entry without `allow` links every
+/// skill, exactly like `Plain`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum SkillTarget {
+    Plain(String),
+    Detailed {
+        path: String,
+        allow: Option<Vec<String>>,
+    },
+}
+
+/// A resolved sync target: its absolute path and, when it came from a
+/// `Detailed` entry with an `allow` list, the set of permitted skill names.
+#[derive(Debug, Clone, PartialEq)]
+struct SyncTarget {
+    path: PathBuf,
+    allow: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -138,21 +160,34 @@ fn skills_source(config: &Config, home: &Path) -> PathBuf {
         .unwrap_or_else(|| home.join("skills"))
 }
 
-fn targets(config: &Config, home: &Path) -> Vec<PathBuf> {
-    if let Some(paths) = config
+fn targets(config: &Config, home: &Path) -> Vec<SyncTarget> {
+    if let Some(entries) = config
         .skills
         .as_ref()
         .and_then(|s| s.targets.as_ref())
-        .filter(|paths| !paths.is_empty())
+        .filter(|entries| !entries.is_empty())
     {
-        return paths.iter().map(|p| expand_tilde(p, home)).collect();
+        return entries
+            .iter()
+            .map(|entry| match entry {
+                SkillTarget::Plain(path) => SyncTarget {
+                    path: expand_tilde(path, home),
+                    allow: None,
+                },
+                SkillTarget::Detailed { path, allow } => SyncTarget {
+                    path: expand_tilde(path, home),
+                    allow: allow.clone(),
+                },
+            })
+            .collect();
     }
-    vec![
-        home.join(".claude/skills"),
-        home.join(".opencode/skills"),
-        home.join(".codex/skills"),
-        home.join(".agents/skills"),
-    ]
+    [".claude/skills", ".opencode/skills", ".codex/skills", ".agents/skills"]
+        .iter()
+        .map(|p| SyncTarget {
+            path: home.join(p),
+            allow: None,
+        })
+        .collect()
 }
 
 fn skip_entries(config: &Config) -> Vec<String> {
@@ -214,38 +249,63 @@ fn sync_skills(home: &Path, config: &Config, dry_run: bool) -> usize {
     let targets = targets(config, home);
     let skip = skip_entries(config);
 
-    let mut active_targets = Vec::new();
+    let mut active_targets: Vec<SyncTarget> = Vec::new();
     if !dry_run {
         for t in &targets {
-            if t == &skills_dir {
+            if t.path == skills_dir {
                 eprintln!(
                     "⚠  Skills: target {} is the source directory; skipping",
-                    t.display()
+                    t.path.display()
                 );
                 continue;
             }
-            if t.is_symlink() {
-                if let Err(err) = fs::remove_file(t) {
+            if t.path.is_symlink() {
+                if let Err(err) = fs::remove_file(&t.path) {
                     eprintln!(
                         "⚠  Skills: cannot replace target symlink {} ({})",
-                        t.display(),
+                        t.path.display(),
                         err
                     );
                     continue;
                 }
             }
-            if let Err(err) = fs::create_dir_all(t) {
-                eprintln!("⚠  Skills: cannot create target {} ({})", t.display(), err);
+            if let Err(err) = fs::create_dir_all(&t.path) {
+                eprintln!("⚠  Skills: cannot create target {} ({})", t.path.display(), err);
                 continue;
             }
             active_targets.push(t.clone());
         }
+        // Resolve the source against symlinks so "is this entry one of ours?"
+        // compares real paths on both sides.
+        let source_dir = fs::canonicalize(&skills_dir).unwrap_or_else(|_| skills_dir.clone());
         for t in &active_targets {
-            if let Ok(entries) = fs::read_dir(t) {
+            if let Ok(entries) = fs::read_dir(&t.path) {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.is_symlink() && !path.exists() {
                         fs::remove_file(&path).ok();
+                        continue;
+                    }
+                    // Prune stale managed links in allowlisted targets. Only
+                    // ever remove a symlink whose resolved destination lives
+                    // inside the skills source and whose name is no longer
+                    // allowed; real files, real directories, and foreign
+                    // symlinks are left untouched.
+                    let Some(allow) = t.allow.as_ref() else {
+                        continue;
+                    };
+                    if !path.is_symlink() {
+                        continue;
+                    }
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if allow.iter().any(|a| a == &name) {
+                        continue;
+                    }
+                    match fs::canonicalize(&path) {
+                        Ok(resolved) if resolved.starts_with(&source_dir) => {
+                            fs::remove_file(&path).ok();
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -287,7 +347,13 @@ fn sync_skills(home: &Path, config: &Config, dry_run: bool) -> usize {
                 println!("  {}{}", name, flag);
             } else {
                 for t in &active_targets {
-                    let dest = t.join(name.as_ref());
+                    // An allowlisted target only receives the named skills.
+                    if let Some(allow) = t.allow.as_ref()
+                        && !allow.iter().any(|a| name.as_ref() == a.as_str())
+                    {
+                        continue;
+                    }
+                    let dest = t.path.join(name.as_ref());
                     if dest.is_symlink() || dest.exists() {
                         if dest.is_dir() && !dest.is_symlink() {
                             fs::remove_dir_all(&dest).ok();
@@ -516,8 +582,9 @@ mod tests {
     fn test_default_targets_use_home() {
         let home = PathBuf::from("/home/user");
         let config = Config::default();
+        let resolved = targets(&config, &home);
         assert_eq!(
-            targets(&config, &home),
+            resolved.iter().map(|t| t.path.clone()).collect::<Vec<_>>(),
             vec![
                 PathBuf::from("/home/user/.claude/skills"),
                 PathBuf::from("/home/user/.opencode/skills"),
@@ -525,6 +592,172 @@ mod tests {
                 PathBuf::from("/home/user/.agents/skills"),
             ]
         );
+        // Default targets are plain: no allow set anywhere.
+        assert!(resolved.iter().all(|t| t.allow.is_none()));
+    }
+
+    /// Create a throwaway directory under the system temp dir for a test.
+    fn test_temp_dir(tag: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("synaxis-test-{tag}-{}-{unique}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// Create a minimal valid skill directory under `source`.
+    fn test_write_skill(source: &Path, name: &str) {
+        let dir = source.join(name);
+        fs::create_dir_all(&dir).expect("create skill dir");
+        fs::write(dir.join("SKILL.md"), "---\nname: test\n---\nbody\n").expect("write SKILL.md");
+    }
+
+    fn test_config_from_toml(raw: &str) -> Config {
+        toml::from_str::<Config>(raw).expect("valid test config")
+    }
+
+    #[test]
+    fn test_plain_string_targets_sync_every_skill() {
+        // Backward compatibility: a plain string target links every skill.
+        let tmp = test_temp_dir("plain-target");
+        let source = tmp.join("skills");
+        fs::create_dir_all(&source).unwrap();
+        test_write_skill(&source, "alpha");
+        test_write_skill(&source, "beta");
+        let target = tmp.join("target");
+        let raw = format!(
+            "[skills]\nsource = {source:?}\ntargets = [{target:?}]\nskip = []\n"
+        );
+        let config = test_config_from_toml(&raw);
+
+        let count = sync_skills(&tmp, &config, false);
+
+        assert_eq!(count, 2, "both source skills are processed");
+        for name in ["alpha", "beta"] {
+            let dest = target.join(name);
+            assert!(dest.is_symlink(), "{name} should be a symlink");
+            assert_eq!(fs::read_link(&dest).unwrap(), source.join(name));
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_detailed_target_with_allow_links_only_allowed_skills() {
+        // A target with an allow list receives symlinks only for named skills,
+        // but the printed count still covers every source skill.
+        let tmp = test_temp_dir("allow-target");
+        let source = tmp.join("skills");
+        fs::create_dir_all(&source).unwrap();
+        test_write_skill(&source, "alpha");
+        test_write_skill(&source, "beta");
+        let target = tmp.join("target");
+        let raw = format!(
+            "[skills]\nsource = {source:?}\ntargets = [{{ path = {target:?}, allow = [\"alpha\"] }}]\nskip = []\n"
+        );
+        let config = test_config_from_toml(&raw);
+
+        let count = sync_skills(&tmp, &config, false);
+
+        assert_eq!(count, 2, "count tracks source skills, not links");
+        let alpha = target.join("alpha");
+        assert!(alpha.is_symlink(), "allowed skill should be linked");
+        assert_eq!(fs::read_link(&alpha).unwrap(), source.join("alpha"));
+        assert!(
+            !target.join("beta").symlink_metadata().is_ok(),
+            "disallowed skill must not be linked"
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_detailed_target_without_allow_behaves_like_plain() {
+        // `{ path = ... }` with no allow key links everything, and the pruning
+        // pass never removes pre-existing source-derived links.
+        let tmp = test_temp_dir("no-allow");
+        let source = tmp.join("skills");
+        fs::create_dir_all(&source).unwrap();
+        test_write_skill(&source, "alpha");
+        let target = tmp.join("target");
+        fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(source.join("alpha"), target.join("alpha"))
+            .expect("pre-link alpha");
+        let raw = format!(
+            "[skills]\nsource = {source:?}\ntargets = [{{ path = {target:?} }}]\nskip = []\n"
+        );
+        let config = test_config_from_toml(&raw);
+
+        sync_skills(&tmp, &config, false);
+
+        assert!(target.join("alpha").is_symlink());
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_allowlisted_target_prunes_stale_source_derived_symlink() {
+        // A pre-existing symlink into the skills source whose name is not in
+        // the allow list is pruned on the next sync.
+        let tmp = test_temp_dir("prune-stale");
+        let source = tmp.join("skills");
+        fs::create_dir_all(&source).unwrap();
+        test_write_skill(&source, "alpha");
+        test_write_skill(&source, "beta");
+        let target = tmp.join("target");
+        fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(source.join("beta"), target.join("beta"))
+            .expect("pre-link stale beta");
+        let raw = format!(
+            "[skills]\nsource = {source:?}\ntargets = [{{ path = {target:?}, allow = [\"alpha\"] }}]\nskip = []\n"
+        );
+        let config = test_config_from_toml(&raw);
+
+        sync_skills(&tmp, &config, false);
+
+        assert!(
+            !target.join("beta").symlink_metadata().is_ok(),
+            "source-derived symlink not in allow must be pruned"
+        );
+        assert!(target.join("alpha").is_symlink(), "allowed skill still linked");
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_allowlisted_target_leaves_foreign_symlink_and_real_dir_untouched() {
+        // A symlink pointing outside the skills source and a real directory in
+        // the target must survive a sync with an allow list.
+        let tmp = test_temp_dir("prune-conservative");
+        let source = tmp.join("skills");
+        fs::create_dir_all(&source).unwrap();
+        test_write_skill(&source, "alpha");
+        let outside = tmp.join("elsewhere");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep.txt"), "data").unwrap();
+        let target = tmp.join("target");
+        fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&outside, target.join("external"))
+            .expect("pre-link foreign");
+        let real = target.join("realskill");
+        fs::create_dir_all(&real).unwrap();
+        fs::write(real.join("notes.md"), "hand made").unwrap();
+        let raw = format!(
+            "[skills]\nsource = {source:?}\ntargets = [{{ path = {target:?}, allow = [\"alpha\"] }}]\nskip = []\n"
+        );
+        let config = test_config_from_toml(&raw);
+
+        sync_skills(&tmp, &config, false);
+
+        let external = target.join("external");
+        assert!(external.is_symlink(), "foreign symlink must stay a symlink");
+        assert_eq!(fs::read_link(&external).unwrap(), outside);
+        assert!(
+            real.is_dir() && !real.is_symlink(),
+            "real directory must stay a real directory"
+        );
+        assert!(real.join("notes.md").is_file(), "real directory contents survive");
+        assert!(target.join("alpha").is_symlink());
+        fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
