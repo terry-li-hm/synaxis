@@ -89,7 +89,7 @@ source = "~/.claude/plugins/marketplaces/every-marketplace"
 platforms = ["codex", "opencode", "gemini"]
 ```
 
-All fields are optional — synaxis falls back to the defaults above if the config file is absent or a field is missing.
+All fields are optional — synaxis falls back to the defaults above if the config file is absent or a field is missing. An empty `targets = []` list means sync nowhere (it does not restore the four defaults). Relative paths are resolved against `$HOME`, not the process working directory. Invalid TOML in the config file is a hard error. Unknown CLI flags are a usage error. MCP and CE failures abort with a non-zero exit and do not print `Done. Restart...`.
 
 ## MCP source format
 

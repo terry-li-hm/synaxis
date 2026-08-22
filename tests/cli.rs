@@ -298,19 +298,24 @@ fn full_skips_ce_when_marketplace_is_absent() {
     );
 
     let out = run_in_home(&home, &["--full"]);
-    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        !out.status.success(),
+        "missing marketplace must fail closed"
+    );
     assert!(
         stderr(&out).contains("every-marketplace not installed")
             || stdout(&out).contains("every-marketplace not installed")
     );
+    let combined = format!("{}{}", stdout(&out), stderr(&out));
+    assert!(
+        !combined.contains("Done. Restart"),
+        "must not print Done after CE failure: {combined}"
+    );
     fs::remove_dir_all(&home).ok();
 }
 
-/// Expected: `--full` should exit non-zero when a CE install fails, so a git
-/// hook cannot report success after a broken compound-engineering install.
-/// Observed: bunx failure is warned and the process still exits 0.
 #[test]
-fn documents_defect_full_exits_zero_when_ce_fails() {
+fn ce_failure_is_fixed() {
     let home = unique_temp("ce-fail");
     let source = home.join("receptors");
     fs::create_dir_all(&source).unwrap();
@@ -336,8 +341,8 @@ fn documents_defect_full_exits_zero_when_ce_fails() {
 
     let out = run_in_home_with_path(&home, &["--full"], Some(&fake_bin));
     assert!(
-        out.status.success(),
-        "current behaviour: --full exits 0 after bunx failure; stderr: {}",
+        !out.status.success(),
+        "bunx failure must fail closed; stderr: {}",
         stderr(&out)
     );
     let combined = format!("{}{}", stdout(&out), stderr(&out));
@@ -345,35 +350,42 @@ fn documents_defect_full_exits_zero_when_ce_fails() {
         combined.contains("install failed"),
         "expected a warning: {combined}"
     );
+    assert!(
+        !combined.contains("Done. Restart"),
+        "must not print Done after CE failure: {combined}"
+    );
     fs::remove_dir_all(&home).ok();
 }
 
-/// Expected: a missing skills source is a non-zero graceful error. Observed:
-/// the binary panics (`cannot read skills source`).
 #[test]
-fn documents_defect_missing_source_is_non_success_via_panic() {
+fn missing_skills_source_is_fixed() {
     let home = unique_temp("missing-src");
+    let target = home.join("out");
     write_config(
         &home,
         &format!(
             "[skills]\nsource = {:?}\ntargets = [{:?}]\nskip = []\n",
             home.join("no-such-skills"),
-            home.join("out")
+            target
         ),
     );
-    let out = run_in_home(&home, &["--check"]);
-    assert!(
-        !out.status.success(),
-        "current behaviour: missing source does not exit 0 (it panics)"
-    );
-    // Do not pin 126/127; the panic path is a host-specific non-zero code.
-    let combined = format!("{}{}", stdout(&out), stderr(&out));
+    let check = run_in_home(&home, &["--check"]);
+    assert!(!check.status.success(), "missing source must be non-zero");
+    let combined = format!("{}{}", stdout(&check), stderr(&check));
     assert!(combined.contains("cannot read skills source"), "{combined}");
+    assert!(
+        !combined.contains("panicked"),
+        "must be a graceful error, not a panic: {combined}"
+    );
+
+    let sync = run_in_home(&home, &[]);
+    assert!(!sync.status.success());
+    assert!(!target.exists(), "must not create targets before aborting");
     fs::remove_dir_all(&home).ok();
 }
 
 #[test]
-fn unknown_flag_behaves_as_default_sync() {
+fn unknown_flag_is_fixed() {
     let home = unique_temp("unknown");
     let source = home.join("receptors");
     fs::create_dir_all(&source).unwrap();
@@ -384,13 +396,16 @@ fn unknown_flag_behaves_as_default_sync() {
         &format!("[skills]\nsource = {source:?}\ntargets = [{target:?}]\nskip = []\n"),
     );
     let out = run_in_home(&home, &["--not-a-real-flag"]);
-    assert!(out.status.success(), "{}", stderr(&out));
-    assert!(target.join("alpha").is_symlink());
+    assert!(!out.status.success(), "unknown flag must be a usage error");
+    let combined = format!("{}{}", stdout(&out), stderr(&out));
+    assert!(combined.contains("unknown argument"), "{combined}");
+    assert!(combined.contains("Usage: synaxis"), "{combined}");
+    assert!(!target.join("alpha").exists());
     fs::remove_dir_all(&home).ok();
 }
 
 #[test]
-fn malformed_mcp_source_does_not_fail_the_process() {
+fn invalid_mcp_json_is_fixed() {
     let home = unique_temp("bad-mcp");
     let source = home.join("receptors");
     fs::create_dir_all(&source).unwrap();
@@ -408,9 +423,74 @@ fn malformed_mcp_source_does_not_fail_the_process() {
         ),
     );
     let out = run_in_home(&home, &["--full"]);
-    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!out.status.success(), "invalid MCP JSON must fail closed");
     let combined = format!("{}{}", stdout(&out), stderr(&out));
     assert!(combined.contains("invalid JSON"), "{combined}");
+    assert!(
+        !combined.contains("Done. Restart"),
+        "must not print Done after MCP failure: {combined}"
+    );
     assert!(!oc.exists());
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn invalid_toml_config_is_fixed() {
+    let home = unique_temp("bad-toml");
+    let source = home.join("skills");
+    fs::create_dir_all(&source).unwrap();
+    write_skill(&source, "alpha", default_skill_body());
+    write_config(&home, "this is not { valid toml");
+    let out = run_in_home(&home, &[]);
+    assert!(!out.status.success(), "invalid TOML must hard-abort");
+    let combined = format!("{}{}", stdout(&out), stderr(&out));
+    assert!(combined.contains("invalid TOML"), "{combined}");
+    assert!(
+        !home.join(".claude/skills/alpha").exists(),
+        "must not fall open to default targets"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn empty_targets_is_fixed() {
+    let home = unique_temp("empty-targets");
+    let source = home.join("skills");
+    fs::create_dir_all(&source).unwrap();
+    write_skill(&source, "alpha", default_skill_body());
+    write_config(
+        &home,
+        &format!("[skills]\nsource = {source:?}\ntargets = []\nskip = []\n"),
+    );
+    let out = run_in_home(&home, &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    for rel in [
+        ".claude/skills",
+        ".opencode/skills",
+        ".codex/skills",
+        ".agents/skills",
+    ] {
+        assert!(
+            !home.join(rel).join("alpha").exists(),
+            "{rel} must not receive a skill when targets is empty"
+        );
+    }
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn failed_target_is_fixed() {
+    let home = unique_temp("failed-target");
+    let source = home.join("skills");
+    fs::create_dir_all(&source).unwrap();
+    write_skill(&source, "alpha", default_skill_body());
+    fs::write(home.join(".claude"), "not a directory").unwrap();
+    let out = run_in_home(&home, &[]);
+    assert!(!out.status.success(), "unusable target must fail closed");
+    let combined = format!("{}{}", stdout(&out), stderr(&out));
+    assert!(
+        !combined.contains("✓  Skills:"),
+        "must not claim success when a target failed: {combined}"
+    );
     fs::remove_dir_all(&home).ok();
 }

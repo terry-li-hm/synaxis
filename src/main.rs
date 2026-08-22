@@ -97,10 +97,14 @@ struct McpServersFile {
 
 #[derive(Debug, Deserialize)]
 struct CodexExtra {
-    url: String,
+    /// Optional so a Codex extra missing `url` does not fail the whole MCP
+    /// file (OpenCode servers must still be written).
+    #[serde(default)]
+    url: Option<String>,
 }
 
 #[derive(Serialize)]
+#[allow(dead_code)] // constructed by unit tests of OpenCode encoding
 struct OpenCodeMcp {
     #[serde(rename = "mcpServers")]
     mcp_servers: serde_json::Value,
@@ -121,35 +125,35 @@ fn expand_tilde(s: &str, home: &Path) -> PathBuf {
     if let Some(rest) = s.strip_prefix("~/") {
         return home.join(rest);
     }
-    PathBuf::from(s)
+    let path = Path::new(s);
+    if path.is_absolute() || s.is_empty() || s.starts_with('~') {
+        // `~name/...` is not a home expansion; only `~` and `~/...` are.
+        path.to_path_buf()
+    } else {
+        // Non-tilde relative paths are home-relative, not cwd-relative.
+        home.join(s)
+    }
 }
 
-fn load_config() -> Config {
-    load_config_from(&home())
-}
-
-fn load_config_from(home: &Path) -> Config {
+fn load_config_from(home: &Path) -> Result<Config, String> {
     let path = config_path(home);
     match fs::read_to_string(&path) {
         Ok(raw) => match toml::from_str::<Config>(&raw) {
-            Ok(cfg) => cfg,
-            Err(err) => {
-                eprintln!(
-                    "⚠  Config: invalid TOML at {}, using defaults ({})",
-                    path.display(),
-                    err
-                );
-                Config::default()
-            }
+            Ok(cfg) => Ok(cfg),
+            Err(err) => Err(format!(
+                "Config: invalid TOML at {}: {}",
+                path.display(),
+                err
+            )),
         },
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Config::default(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
         Err(err) => {
             eprintln!(
                 "⚠  Config: cannot read {}, using defaults ({})",
                 path.display(),
                 err
             );
-            Config::default()
+            Ok(Config::default())
         }
     }
 }
@@ -162,22 +166,27 @@ enum Mode {
     Sync { full: bool },
 }
 
+const KNOWN_FLAGS: &[&str] = &["--help", "-h", "--init", "--full", "--check"];
+
 /// Flag parsing for the CLI. Help wins over init; init wins over the rest;
 /// `--check` wins over `--full` (dry-run never mutates). Unknown flags are
-/// ignored, matching the historical `args.iter().any(...)` checks in `main`.
-fn parse_args(args: &[String]) -> Mode {
+/// a usage error.
+fn parse_args(args: &[String]) -> Result<Mode, String> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        return Mode::Help;
+        return Ok(Mode::Help);
+    }
+    if let Some(unknown) = args.iter().find(|a| !KNOWN_FLAGS.contains(&a.as_str())) {
+        return Err(format!("unknown argument: {unknown}"));
     }
     if args.iter().any(|a| a == "--init") {
-        return Mode::Init;
+        return Ok(Mode::Init);
     }
     let full = args.iter().any(|a| a == "--full");
     let check = args.iter().any(|a| a == "--check");
     if check {
-        Mode::Check
+        Ok(Mode::Check)
     } else {
-        Mode::Sync { full }
+        Ok(Mode::Sync { full })
     }
 }
 
@@ -186,17 +195,13 @@ fn skills_source(config: &Config, home: &Path) -> PathBuf {
         .skills
         .as_ref()
         .and_then(|s| s.source.as_deref())
+        .filter(|s| !s.is_empty())
         .map(|s| expand_tilde(s, home))
         .unwrap_or_else(|| home.join("skills"))
 }
 
 fn targets(config: &Config, home: &Path) -> Vec<SyncTarget> {
-    if let Some(entries) = config
-        .skills
-        .as_ref()
-        .and_then(|s| s.targets.as_ref())
-        .filter(|entries| !entries.is_empty())
-    {
+    if let Some(entries) = config.skills.as_ref().and_then(|s| s.targets.as_ref()) {
         return entries
             .iter()
             .map(|entry| match entry {
@@ -279,12 +284,72 @@ fn ce_platforms(config: &Config) -> Vec<String> {
     ]
 }
 
-fn sync_skills(home: &Path, config: &Config, dry_run: bool) -> usize {
+fn is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+fn has_yaml_frontmatter(content: &str) -> bool {
+    content
+        .strip_prefix('\u{feff}')
+        .unwrap_or(content)
+        .starts_with("---")
+}
+
+/// A source entry is a skill when it is a real directory (not a symlink)
+/// containing a regular `SKILL.md` file (not a directory of that name).
+fn is_skill_directory(item: &Path) -> bool {
+    match fs::symlink_metadata(item) {
+        Ok(meta) if meta.file_type().is_dir() => item.join("SKILL.md").is_file(),
+        _ => false,
+    }
+}
+
+/// Whether `link` is a synaxis-managed symlink into `source_dir`.
+/// Uses the link text so dangling managed links still classify.
+fn is_managed_symlink(link: &Path, source_dir: &Path) -> bool {
+    let Ok(target) = fs::read_link(link) else {
+        return false;
+    };
+    let resolved = if target.is_absolute() {
+        target
+    } else {
+        match link.parent() {
+            Some(parent) => parent.join(target),
+            None => target,
+        }
+    };
+    if let Ok(dest) = fs::canonicalize(&resolved) {
+        return dest.starts_with(source_dir);
+    }
+    resolved.starts_with(source_dir)
+}
+
+fn sync_skills(home: &Path, config: &Config, dry_run: bool) -> Result<usize, String> {
     let skills_dir = skills_source(config, home);
     let targets = targets(config, home);
     let skip = skip_entries(config);
 
+    match fs::metadata(&skills_dir) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            return Err(format!(
+                "cannot read skills source {} (not a directory)",
+                skills_dir.display()
+            ));
+        }
+        Err(err) => {
+            return Err(format!(
+                "cannot read skills source {} ({})",
+                skills_dir.display(),
+                err
+            ));
+        }
+    }
+
     let mut active_targets: Vec<SyncTarget> = Vec::new();
+    let mut failed_targets = 0usize;
     if !dry_run {
         for t in &targets {
             if t.path == skills_dir {
@@ -294,15 +359,16 @@ fn sync_skills(home: &Path, config: &Config, dry_run: bool) -> usize {
                 );
                 continue;
             }
-            if t.path.is_symlink() {
-                if let Err(err) = fs::remove_file(&t.path) {
-                    eprintln!(
-                        "⚠  Skills: cannot replace target symlink {} ({})",
-                        t.path.display(),
-                        err
-                    );
-                    continue;
-                }
+            if t.path.is_symlink()
+                && let Err(err) = fs::remove_file(&t.path)
+            {
+                eprintln!(
+                    "⚠  Skills: cannot replace target symlink {} ({})",
+                    t.path.display(),
+                    err
+                );
+                failed_targets += 1;
+                continue;
             }
             if let Err(err) = fs::create_dir_all(&t.path) {
                 eprintln!(
@@ -310,6 +376,7 @@ fn sync_skills(home: &Path, config: &Config, dry_run: bool) -> usize {
                     t.path.display(),
                     err
                 );
+                failed_targets += 1;
                 continue;
             }
             active_targets.push(t.clone());
@@ -321,30 +388,21 @@ fn sync_skills(home: &Path, config: &Config, dry_run: bool) -> usize {
             if let Ok(entries) = fs::read_dir(&t.path) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.is_symlink() && !path.exists() {
-                        fs::remove_file(&path).ok();
+                    if !is_symlink(&path) {
                         continue;
                     }
-                    // Prune stale managed links in allowlisted targets. Only
-                    // ever remove a symlink whose resolved destination lives
-                    // inside the skills source and whose name is no longer
-                    // allowed; real files, real directories, and foreign
-                    // symlinks are left untouched.
-                    let Some(allow) = t.allow.as_ref() else {
-                        continue;
-                    };
-                    if !path.is_symlink() {
+                    if !is_managed_symlink(&path, &source_dir) {
                         continue;
                     }
                     let name = entry.file_name().to_string_lossy().to_string();
-                    if allow.iter().any(|a| a == &name) {
-                        continue;
-                    }
-                    match fs::canonicalize(&path) {
-                        Ok(resolved) if resolved.starts_with(&source_dir) => {
-                            fs::remove_file(&path).ok();
-                        }
-                        _ => {}
+                    let dangling = !path.exists();
+                    let skipped = skip.iter().any(|s| s == &name);
+                    let disallowed = t
+                        .allow
+                        .as_ref()
+                        .is_some_and(|allow| !allow.iter().any(|a| a == &name));
+                    if dangling || skipped || disallowed {
+                        fs::remove_file(&path).ok();
                     }
                 }
             }
@@ -353,16 +411,18 @@ fn sync_skills(home: &Path, config: &Config, dry_run: bool) -> usize {
 
     let mut count = 0;
     let mut entries: Vec<_> = fs::read_dir(&skills_dir)
-        .unwrap_or_else(|err| {
-            panic!(
+        .map_err(|err| {
+            format!(
                 "cannot read skills source {} ({})",
                 skills_dir.display(),
                 err
             )
-        })
+        })?
         .flatten()
         .collect();
     entries.sort_by_key(|e| e.file_name());
+
+    let source_dir = fs::canonicalize(&skills_dir).unwrap_or_else(|_| skills_dir.clone());
 
     for entry in entries {
         let item = entry.path();
@@ -370,9 +430,9 @@ fn sync_skills(home: &Path, config: &Config, dry_run: bool) -> usize {
         if skip.iter().any(|s| s == name.as_ref()) {
             continue;
         }
-        if item.is_dir() && item.join("SKILL.md").exists() {
+        if is_skill_directory(&item) {
             let has_frontmatter = fs::read_to_string(item.join("SKILL.md"))
-                .map(|c| c.starts_with("---"))
+                .map(|c| has_yaml_frontmatter(&c))
                 .unwrap_or(false);
             if !has_frontmatter {
                 eprintln!("⚠  Skills: {}/SKILL.md missing YAML frontmatter", name);
@@ -393,11 +453,17 @@ fn sync_skills(home: &Path, config: &Config, dry_run: bool) -> usize {
                         continue;
                     }
                     let dest = t.path.join(name.as_ref());
-                    if dest.is_symlink() || dest.exists() {
-                        if dest.is_dir() && !dest.is_symlink() {
-                            fs::remove_dir_all(&dest).ok();
+                    if let Ok(meta) = fs::symlink_metadata(&dest) {
+                        if meta.file_type().is_symlink() {
+                            if is_managed_symlink(&dest, &source_dir) {
+                                fs::remove_file(&dest).ok();
+                            } else {
+                                eprintln!("⚠  Skills: leaving existing symlink {}", dest.display());
+                                continue;
+                            }
                         } else {
-                            fs::remove_file(&dest).ok();
+                            eprintln!("⚠  Skills: leaving existing path {}", dest.display());
+                            continue;
                         }
                     }
                     if let Err(err) = std::os::unix::fs::symlink(&item, &dest) {
@@ -413,62 +479,99 @@ fn sync_skills(home: &Path, config: &Config, dry_run: bool) -> usize {
             count += 1;
         }
     }
-    count
+    if failed_targets > 0 {
+        return Err(format!(
+            "Skills: {failed_targets} target(s) could not be prepared"
+        ));
+    }
+    Ok(count)
 }
 
-fn sync_mcp(home: &Path, config: &Config) {
+fn write_opencode_mcp(path: &Path, mcp_servers: serde_json::Value) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "MCP: cannot create OpenCode config parent {} ({})",
+                parent.display(),
+                err
+            )
+        })?;
+    }
+    let mut root = match fs::read_to_string(path) {
+        Ok(existing) => serde_json::from_str::<serde_json::Value>(&existing)
+            .ok()
+            .filter(|v| v.is_object())
+            .unwrap_or_else(|| serde_json::json!({})),
+        Err(_) => serde_json::json!({}),
+    };
+    root.as_object_mut()
+        .expect("object")
+        .insert("mcpServers".to_string(), mcp_servers);
+    let json = serde_json::to_string_pretty(&root)
+        .map_err(|_| "MCP: failed encoding OpenCode config".to_string())?;
+    fs::write(path, format!("{json}\n"))
+        .map_err(|_| "MCP: failed writing OpenCode config".to_string())?;
+    Ok(())
+}
+
+fn sync_mcp(home: &Path, config: &Config) -> Result<(), String> {
     let source = mcp_source(config, home);
     let raw = match fs::read_to_string(&source) {
         Ok(content) => content,
         Err(_) => {
-            eprintln!("⚠  MCP: cannot read {}, skipping", source.display());
-            return;
+            let msg = format!("MCP: cannot read {}, skipping", source.display());
+            eprintln!("⚠  {msg}");
+            return Err(msg);
         }
     };
 
     let parsed: McpServersFile = match serde_json::from_str(&raw) {
         Ok(data) => data,
         Err(_) => {
-            eprintln!("⚠  MCP: invalid JSON in {}, skipping", source.display());
-            return;
+            let msg = format!("MCP: invalid JSON in {}, skipping", source.display());
+            eprintln!("⚠  {msg}");
+            return Err(msg);
         }
     };
 
-    let opencode_path = mcp_opencode_path(config, home);
-    if let Some(parent) = opencode_path.parent() {
-        fs::create_dir_all(parent).ok();
-    }
-    let opencode_body = OpenCodeMcp {
-        mcp_servers: normalize_mcp_servers(parsed.mcp_servers.clone()),
-    };
-    match serde_json::to_string_pretty(&opencode_body) {
-        Ok(json) => {
-            if fs::write(&opencode_path, format!("{json}\n")).is_ok() {
-                println!("✓  MCP: wrote OpenCode config");
-            } else {
-                eprintln!("⚠  MCP: failed writing OpenCode config");
+    let mut extras = BTreeMap::new();
+    for (name, extra) in parsed.codex_extras {
+        match extra.url {
+            Some(url) if !url.is_empty() => {
+                extras.insert(name, CodexExtra { url: Some(url) });
             }
+            _ => eprintln!("⚠  MCP: _codexExtras entry '{name}' missing url, skipping"),
         }
-        Err(_) => eprintln!("⚠  MCP: failed encoding OpenCode config"),
     }
 
     let codex_path = mcp_codex_path(config, home);
-    if let Some(parent) = codex_path.parent() {
-        fs::create_dir_all(parent).ok();
-    }
     let existing = fs::read_to_string(&codex_path).unwrap_or_default();
-    let managed_block = build_codex_mcp_block(&parsed.codex_extras);
+    let managed_block = build_codex_mcp_block(&extras);
     let updated = match replace_or_append_managed_block(&existing, &managed_block) {
         Ok(content) => content,
         Err(msg) => {
             eprintln!("⚠  MCP: {}", msg);
-            return;
+            return Err(format!("MCP: {msg}"));
         }
     };
+
+    let opencode_path = mcp_opencode_path(config, home);
+    write_opencode_mcp(
+        &opencode_path,
+        normalize_mcp_servers(parsed.mcp_servers.clone()),
+    )?;
+    println!("✓  MCP: wrote OpenCode config");
+
+    if let Some(parent) = codex_path.parent() {
+        fs::create_dir_all(parent).ok();
+    }
     if fs::write(&codex_path, updated).is_ok() {
         println!("✓  MCP: wrote Codex config block");
+        Ok(())
     } else {
-        eprintln!("⚠  MCP: failed writing Codex config");
+        let msg = "MCP: failed writing Codex config".to_string();
+        eprintln!("⚠  {msg}");
+        Err(msg)
     }
 }
 
@@ -507,8 +610,11 @@ fn build_codex_mcp_block(codex_extras: &BTreeMap<String, CodexExtra>) -> String 
     out.push_str(MCP_BEGIN);
     out.push('\n');
     for (name, extra) in codex_extras {
+        let Some(url) = extra.url.as_ref() else {
+            continue;
+        };
         out.push_str(&format!("[mcp_servers.{}]\n", toml_key(name)));
-        let url = serde_json::to_string(&extra.url).unwrap_or_else(|_| "\"\"".to_string());
+        let url = serde_json::to_string(url).unwrap_or_else(|_| "\"\"".to_string());
         out.push_str(&format!("url = {}\n", url));
     }
     out.push_str(MCP_END);
@@ -557,13 +663,15 @@ fn replace_or_append_managed_block(existing: &str, block: &str) -> Result<String
     Ok(out)
 }
 
-fn sync_ce(home: &Path, config: &Config) {
+fn sync_ce(home: &Path, config: &Config) -> Result<(), String> {
     let ce_dir = ce_source(config, home);
     if !ce_dir.exists() {
-        eprintln!("⚠  CE: every-marketplace not installed, skipping");
-        return;
+        let msg = "CE: every-marketplace not installed, skipping";
+        eprintln!("⚠  {msg}");
+        return Err(msg.to_string());
     }
 
+    let mut failed = false;
     for target in ce_platforms(config) {
         let status = Command::new("bunx")
             .args([
@@ -579,12 +687,31 @@ fn sync_ce(home: &Path, config: &Config) {
             Ok(s) if s.success() => {
                 println!("✓  CE: compound-engineering installed to {}", target)
             }
-            _ => eprintln!(
-                "⚠  CE: compound-engineering install failed for {}, continuing",
-                target
-            ),
+            _ => {
+                eprintln!(
+                    "⚠  CE: compound-engineering install failed for {}, continuing",
+                    target
+                );
+                failed = true;
+            }
         }
     }
+    if failed {
+        Err("CE: one or more platform installs failed".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn print_usage(cfg_path: &Path) {
+    println!("Usage: synaxis [--full] [--check] [--init]");
+    println!();
+    println!("  (default)  Sync skills symlinks (fast, safe for git hooks)");
+    println!("  --full     Skills + MCP + compound-engineering");
+    println!("  --check    Dry run — list skills, no changes");
+    println!("  --init     Create default config at ~/.config/synaxis/config.toml");
+    println!();
+    println!("Config file: {}", cfg_path.display());
 }
 
 fn main() {
@@ -593,27 +720,25 @@ fn main() {
     let cfg_path = config_path(&home);
 
     match parse_args(&args) {
-        Mode::Help => {
-            println!("Usage: synaxis [--full] [--check] [--init]");
-            println!();
-            println!("  (default)  Sync skills symlinks (fast, safe for git hooks)");
-            println!("  --full     Skills + MCP + compound-engineering");
-            println!("  --check    Dry run — list skills, no changes");
-            println!("  --init     Create default config at ~/.config/synaxis/config.toml");
-            println!();
-            println!("Config file: {}", cfg_path.display());
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            print_usage(&cfg_path);
+            exit(1);
+        }
+        Ok(Mode::Help) => {
+            print_usage(&cfg_path);
             exit(0);
         }
-        Mode::Init => {
+        Ok(Mode::Init) => {
             if cfg_path.exists() {
                 println!("Config already exists at {}", cfg_path.display());
                 exit(0);
             }
-            if let Some(parent) = cfg_path.parent() {
-                if let Err(err) = fs::create_dir_all(parent) {
-                    eprintln!("failed to create {} ({})", parent.display(), err);
-                    exit(1);
-                }
+            if let Some(parent) = cfg_path.parent()
+                && let Err(err) = fs::create_dir_all(parent)
+            {
+                eprintln!("failed to create {} ({})", parent.display(), err);
+                exit(1);
             }
             if let Err(err) = fs::write(&cfg_path, DEFAULT_CONFIG) {
                 eprintln!("failed to write {} ({})", cfg_path.display(), err);
@@ -622,22 +747,54 @@ fn main() {
             println!("Wrote default config to {}", cfg_path.display());
             exit(0);
         }
-        Mode::Check => {
-            let config = load_config();
+        Ok(Mode::Check) => {
+            let config = match load_config_from(&home) {
+                Ok(cfg) => cfg,
+                Err(err) => {
+                    eprintln!("{err}");
+                    exit(1);
+                }
+            };
             println!("Skills in {}:", skills_source(&config, &home).display());
-            let count = sync_skills(&home, &config, true);
-            println!("{} skills", count);
+            match sync_skills(&home, &config, true) {
+                Ok(count) => println!("{} skills", count),
+                Err(err) => {
+                    eprintln!("{err}");
+                    exit(1);
+                }
+            }
             exit(0);
         }
-        Mode::Sync { full } => {
-            let config = load_config();
-            let count = sync_skills(&home, &config, false);
-            eprintln!("✓  Skills: {} synced", count);
+        Ok(Mode::Sync { full }) => {
+            let config = match load_config_from(&home) {
+                Ok(cfg) => cfg,
+                Err(err) => {
+                    eprintln!("{err}");
+                    exit(1);
+                }
+            };
+            let mut failed = false;
+            match sync_skills(&home, &config, false) {
+                Ok(count) => eprintln!("✓  Skills: {} synced", count),
+                Err(err) => {
+                    eprintln!("{err}");
+                    failed = true;
+                }
+            }
 
             if full {
-                sync_mcp(&home, &config);
-                sync_ce(&home, &config);
-                eprintln!("Done. Restart Codex/OpenCode to pick up changes.");
+                if sync_mcp(&home, &config).is_err() {
+                    failed = true;
+                }
+                if sync_ce(&home, &config).is_err() {
+                    failed = true;
+                }
+                if !failed {
+                    eprintln!("Done. Restart Codex/OpenCode to pick up changes.");
+                }
+            }
+            if failed {
+                exit(1);
             }
         }
     }
@@ -729,7 +886,7 @@ mod tests {
         let raw = format!("[skills]\nsource = {source:?}\ntargets = [{target:?}]\nskip = []\n");
         let config = test_config_from_toml(&raw);
 
-        let count = sync_skills(&tmp, &config, false);
+        let count = sync_skills(&tmp, &config, false).expect("sync");
 
         assert_eq!(count, 2, "both source skills are processed");
         for name in ["alpha", "beta"] {
@@ -755,7 +912,7 @@ mod tests {
         );
         let config = test_config_from_toml(&raw);
 
-        let count = sync_skills(&tmp, &config, false);
+        let count = sync_skills(&tmp, &config, false).expect("sync");
 
         assert_eq!(count, 2, "count tracks source skills, not links");
         let alpha = target.join("alpha");
@@ -785,7 +942,7 @@ mod tests {
         );
         let config = test_config_from_toml(&raw);
 
-        sync_skills(&tmp, &config, false);
+        sync_skills(&tmp, &config, false).expect("sync");
 
         assert!(target.join("alpha").is_symlink());
         fs::remove_dir_all(&tmp).ok();
@@ -809,7 +966,7 @@ mod tests {
         );
         let config = test_config_from_toml(&raw);
 
-        sync_skills(&tmp, &config, false);
+        sync_skills(&tmp, &config, false).expect("sync");
 
         assert!(
             target.join("beta").symlink_metadata().is_err(),
@@ -844,7 +1001,7 @@ mod tests {
         );
         let config = test_config_from_toml(&raw);
 
-        sync_skills(&tmp, &config, false);
+        sync_skills(&tmp, &config, false).expect("sync");
 
         let external = target.join("external");
         assert!(external.is_symlink(), "foreign symlink must stay a symlink");
@@ -993,7 +1150,7 @@ mod tests {
         extras.insert(
             "my-server".to_string(),
             CodexExtra {
-                url: "https://example.com/path?q=1&r=2".to_string(),
+                url: Some("https://example.com/path?q=1&r=2".to_string()),
             },
         );
         let block = build_codex_mcp_block(&extras);
@@ -1012,7 +1169,7 @@ mod tests {
         extras.insert(
             "my.server".to_string(),
             CodexExtra {
-                url: "https://example.com".to_string(),
+                url: Some("https://example.com".to_string()),
             },
         );
         let block = build_codex_mcp_block(&extras);
@@ -1028,60 +1185,68 @@ mod tests {
 
     #[test]
     fn test_parse_args_empty_is_skills_only_sync() {
-        assert_eq!(parse_args(&args(&[])), Mode::Sync { full: false });
+        assert_eq!(parse_args(&args(&[])).unwrap(), Mode::Sync { full: false });
     }
 
     #[test]
     fn test_parse_args_full() {
-        assert_eq!(parse_args(&args(&["--full"])), Mode::Sync { full: true });
+        assert_eq!(
+            parse_args(&args(&["--full"])).unwrap(),
+            Mode::Sync { full: true }
+        );
     }
 
     #[test]
     fn test_parse_args_check() {
-        assert_eq!(parse_args(&args(&["--check"])), Mode::Check);
+        assert_eq!(parse_args(&args(&["--check"])).unwrap(), Mode::Check);
     }
 
     #[test]
     fn test_parse_args_init() {
-        assert_eq!(parse_args(&args(&["--init"])), Mode::Init);
+        assert_eq!(parse_args(&args(&["--init"])).unwrap(), Mode::Init);
     }
 
     #[test]
     fn test_parse_args_help_long_and_short() {
-        assert_eq!(parse_args(&args(&["--help"])), Mode::Help);
-        assert_eq!(parse_args(&args(&["-h"])), Mode::Help);
+        assert_eq!(parse_args(&args(&["--help"])).unwrap(), Mode::Help);
+        assert_eq!(parse_args(&args(&["-h"])).unwrap(), Mode::Help);
     }
 
     #[test]
     fn test_parse_args_help_wins_over_other_flags() {
         assert_eq!(
-            parse_args(&args(&["--init", "--help", "--full"])),
+            parse_args(&args(&["--init", "--help", "--full"])).unwrap(),
             Mode::Help
         );
-        assert_eq!(parse_args(&args(&["-h", "--check"])), Mode::Help);
+        assert_eq!(parse_args(&args(&["-h", "--check"])).unwrap(), Mode::Help);
     }
 
     #[test]
     fn test_parse_args_init_wins_over_sync_flags() {
-        assert_eq!(parse_args(&args(&["--full", "--init"])), Mode::Init);
+        assert_eq!(
+            parse_args(&args(&["--full", "--init"])).unwrap(),
+            Mode::Init
+        );
     }
 
     #[test]
     fn test_parse_args_check_wins_over_full() {
-        assert_eq!(parse_args(&args(&["--full", "--check"])), Mode::Check);
-        assert_eq!(parse_args(&args(&["--check", "--full"])), Mode::Check);
+        assert_eq!(
+            parse_args(&args(&["--full", "--check"])).unwrap(),
+            Mode::Check
+        );
+        assert_eq!(
+            parse_args(&args(&["--check", "--full"])).unwrap(),
+            Mode::Check
+        );
     }
 
     #[test]
-    fn test_parse_args_unknown_flags_are_ignored() {
-        assert_eq!(
-            parse_args(&args(&["--unknown", "--also-not-a-flag"])),
-            Mode::Sync { full: false }
-        );
-        assert_eq!(
-            parse_args(&args(&["--full", "--unknown"])),
-            Mode::Sync { full: true }
-        );
+    fn unknown_flags_is_fixed() {
+        let err = parse_args(&args(&["--unknown", "--also-not-a-flag"])).unwrap_err();
+        assert!(err.contains("unknown argument: --unknown"), "{err}");
+        let err = parse_args(&args(&["--full", "--unknown"])).unwrap_err();
+        assert!(err.contains("unknown argument: --unknown"), "{err}");
     }
 
     #[test]
@@ -1090,7 +1255,7 @@ mod tests {
         assert_eq!(expand_tilde("", &home), PathBuf::from(""));
         assert_eq!(
             expand_tilde("relative/path", &home),
-            PathBuf::from("relative/path")
+            PathBuf::from("/home/user/relative/path")
         );
         assert_eq!(expand_tilde("~/", &home), home.clone());
         assert_eq!(
@@ -1234,7 +1399,7 @@ mod tests {
     #[test]
     fn test_load_config_from_missing_file_is_default() {
         let tmp = test_temp_dir("cfg-missing");
-        let cfg = load_config_from(&tmp);
+        let cfg = load_config_from(&tmp).unwrap();
         assert!(cfg.skills.is_none());
         assert!(cfg.mcp.is_none());
         assert!(cfg.ce.is_none());
@@ -1245,7 +1410,7 @@ mod tests {
     fn test_load_config_from_valid_file() {
         let tmp = test_temp_dir("cfg-valid");
         write_config_file(&tmp, "[skills]\nsource = \"~/receptors\"\n");
-        let cfg = load_config_from(&tmp);
+        let cfg = load_config_from(&tmp).unwrap();
         assert_eq!(
             cfg.skills.as_ref().and_then(|s| s.source.as_deref()),
             Some("~/receptors")
@@ -1263,7 +1428,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
         }
-        let cfg = load_config_from(&tmp);
+        let cfg = load_config_from(&tmp).unwrap();
         assert!(
             cfg.skills.is_none(),
             "unreadable config must fail-open to defaults"
@@ -1289,7 +1454,7 @@ mod tests {
         );
         let config = test_config_from_toml(&raw);
 
-        let count = sync_skills(&tmp, &config, false);
+        let count = sync_skills(&tmp, &config, false).expect("sync");
 
         assert_eq!(count, 1);
         assert!(target.join("keep").is_symlink());
@@ -1309,7 +1474,7 @@ mod tests {
         let raw = format!("[skills]\nsource = {source:?}\ntargets = [{target:?}]\nskip = []\n");
         let config = test_config_from_toml(&raw);
 
-        let count = sync_skills(&tmp, &config, false);
+        let count = sync_skills(&tmp, &config, false).expect("sync");
 
         assert_eq!(count, 1);
         assert!(target.join("real").is_symlink());
@@ -1328,7 +1493,7 @@ mod tests {
         let raw = format!("[skills]\nsource = {source:?}\ntargets = [{target:?}]\nskip = []\n");
         let config = test_config_from_toml(&raw);
 
-        let count = sync_skills(&tmp, &config, false);
+        let count = sync_skills(&tmp, &config, false).expect("sync");
 
         assert_eq!(count, 1);
         let dest = target.join("技能");
@@ -1348,7 +1513,7 @@ mod tests {
         let raw = format!("[skills]\nsource = {source:?}\ntargets = [{target:?}]\nskip = []\n");
         let config = test_config_from_toml(&raw);
 
-        let count = sync_skills(&tmp, &config, false);
+        let count = sync_skills(&tmp, &config, false).expect("sync");
 
         assert_eq!(count, 1);
         assert!(target.join("bare").is_symlink());
@@ -1365,7 +1530,7 @@ mod tests {
         let raw = format!("[skills]\nsource = {source:?}\ntargets = [{target:?}]\nskip = []\n");
         let config = test_config_from_toml(&raw);
 
-        let count = sync_skills(&tmp, &config, true);
+        let count = sync_skills(&tmp, &config, true).expect("sync");
 
         assert_eq!(count, 1);
         assert!(
@@ -1384,7 +1549,7 @@ mod tests {
         let raw = format!("[skills]\nsource = {source:?}\ntargets = [{source:?}]\nskip = []\n");
         let config = test_config_from_toml(&raw);
 
-        let count = sync_skills(&tmp, &config, false);
+        let count = sync_skills(&tmp, &config, false).expect("sync");
 
         assert_eq!(count, 1);
         // Source dir must remain a real directory of skills, not a place we
@@ -1407,7 +1572,7 @@ mod tests {
         let raw = format!("[skills]\nsource = {source:?}\ntargets = [{target:?}]\nskip = []\n");
         let config = test_config_from_toml(&raw);
 
-        sync_skills(&tmp, &config, false);
+        sync_skills(&tmp, &config, false).expect("sync");
 
         assert!(target.is_dir() && !target.is_symlink());
         assert!(target.join("alpha").is_symlink());
@@ -1432,7 +1597,7 @@ mod tests {
         );
         let config = test_config_from_toml(&raw);
 
-        let count = sync_skills(&tmp, &config, false);
+        let count = sync_skills(&tmp, &config, false).expect("sync");
 
         assert_eq!(count, 1);
         assert!(
@@ -1464,7 +1629,7 @@ mod tests {
         .unwrap();
         let config = mcp_config(&source, &opencode, &codex);
 
-        sync_mcp(&tmp, &config);
+        sync_mcp(&tmp, &config).expect("mcp");
 
         let oc: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&opencode).unwrap()).unwrap();
@@ -1485,7 +1650,7 @@ mod tests {
         let codex = tmp.join("codex/config.toml");
         let config = mcp_config(&source, &opencode, &codex);
 
-        sync_mcp(&tmp, &config);
+        assert!(sync_mcp(&tmp, &config).is_err());
 
         assert!(!opencode.exists());
         assert!(!codex.exists());
@@ -1501,7 +1666,7 @@ mod tests {
         let codex = tmp.join("codex/config.toml");
         let config = mcp_config(&source, &opencode, &codex);
 
-        sync_mcp(&tmp, &config);
+        assert!(sync_mcp(&tmp, &config).is_err());
 
         assert!(!opencode.exists());
         assert!(!codex.exists());
@@ -1524,9 +1689,10 @@ mod tests {
         fs::write(&codex, &original).unwrap();
         let config = mcp_config(&source, &opencode, &codex);
 
-        sync_mcp(&tmp, &config);
+        assert!(sync_mcp(&tmp, &config).is_err());
 
         assert_eq!(fs::read_to_string(&codex).unwrap(), original);
+        assert!(!opencode.exists());
         fs::remove_dir_all(&tmp).ok();
     }
 
@@ -1539,7 +1705,7 @@ mod tests {
         let codex = tmp.join("codex/config.toml");
         let config = mcp_config(&source, &opencode, &codex);
 
-        sync_mcp(&tmp, &config);
+        sync_mcp(&tmp, &config).expect("mcp");
 
         let oc: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&opencode).unwrap()).unwrap();
@@ -1547,67 +1713,51 @@ mod tests {
         fs::remove_dir_all(&tmp).ok();
     }
 
-    /// Expected: abort with a hard error so a typo cannot retarget the default
-    /// `~/skills` tree. Observed: invalid TOML is warned about and the empty
-    /// default config is used instead.
     #[test]
-    fn documents_defect_invalid_config_silently_uses_defaults() {
+    fn invalid_toml_config_is_fixed() {
         let tmp = test_temp_dir("cfg-invalid");
         write_config_file(&tmp, "this is not { valid toml");
-        let cfg = load_config_from(&tmp);
-        assert!(
-            cfg.skills.is_none() && cfg.mcp.is_none() && cfg.ce.is_none(),
-            "current fail-open: malformed config becomes Config::default()"
-        );
+        let err = load_config_from(&tmp).unwrap_err();
+        assert!(err.contains("invalid TOML"), "{err}");
         fs::remove_dir_all(&tmp).ok();
     }
 
-    /// Expected: `targets = []` means "sync nowhere". Observed: an empty
-    /// list is treated as missing and the four default target paths are used.
     #[test]
-    fn documents_defect_empty_targets_fall_back_to_defaults() {
+    fn empty_targets_is_fixed() {
         let home = PathBuf::from("/home/user");
         let config = test_config_from_toml("[skills]\ntargets = []\n");
         let resolved = targets(&config, &home);
+        assert!(resolved.is_empty(), "empty targets must sync nowhere");
+    }
+
+    #[test]
+    fn empty_source_is_fixed() {
+        let home = PathBuf::from("/home/user");
+        let config = test_config_from_toml("[skills]\nsource = \"\"\n");
         assert_eq!(
-            resolved.iter().map(|t| t.path.clone()).collect::<Vec<_>>(),
-            vec![
-                PathBuf::from("/home/user/.claude/skills"),
-                PathBuf::from("/home/user/.opencode/skills"),
-                PathBuf::from("/home/user/.codex/skills"),
-                PathBuf::from("/home/user/.agents/skills"),
-            ]
+            skills_source(&config, &home),
+            PathBuf::from("/home/user/skills")
         );
     }
 
-    /// Expected: an empty `source` is rejected (or treated as missing so the
-    /// default `~/skills` applies). Observed: `expand_tilde("")` yields an
-    /// empty path, which `read_dir` interprets as the process cwd.
     #[test]
-    fn documents_defect_empty_source_path_is_cwd() {
-        let home = PathBuf::from("/home/user");
-        let config = test_config_from_toml("[skills]\nsource = \"\"\n");
-        assert_eq!(skills_source(&config, &home), PathBuf::from(""));
-    }
-
-    /// Expected: missing skills source is a graceful error / empty listing,
-    /// including for `--check`. Observed: `sync_skills` panics.
-    #[test]
-    #[should_panic(expected = "cannot read skills source")]
-    fn documents_defect_missing_skills_source_panics() {
+    fn missing_skills_source_is_fixed() {
         let tmp = test_temp_dir("missing-src");
         let source = tmp.join("skills");
         let target = tmp.join("target");
         let raw = format!("[skills]\nsource = {source:?}\ntargets = [{target:?}]\nskip = []\n");
         let config = test_config_from_toml(&raw);
-        let _ = sync_skills(&tmp, &config, true);
+        let err = sync_skills(&tmp, &config, false).unwrap_err();
+        assert!(err.contains("cannot read skills source"), "{err}");
+        assert!(
+            !target.exists(),
+            "missing source must not create target directories"
+        );
+        fs::remove_dir_all(&tmp).ok();
     }
 
-    /// Expected: a real directory already living in a target is left
-    /// untouched (the prune path documents this invariant). Observed: the
-    /// link pass `remove_dir_all`s it and replaces it with a symlink.
     #[test]
-    fn documents_defect_link_pass_deletes_real_target_directory() {
+    fn real_target_directory_is_fixed() {
         let tmp = test_temp_dir("clobber-dir");
         let source = tmp.join("skills");
         fs::create_dir_all(&source).unwrap();
@@ -1619,25 +1769,39 @@ mod tests {
         let raw = format!("[skills]\nsource = {source:?}\ntargets = [{target:?}]\nskip = []\n");
         let config = test_config_from_toml(&raw);
 
-        sync_skills(&tmp, &config, false);
+        sync_skills(&tmp, &config, false).expect("sync");
 
         let dest = target.join("alpha");
-        assert!(
-            dest.is_symlink(),
-            "current behaviour: real directory is replaced with a symlink"
-        );
-        assert!(
-            !dest.join("precious.txt").exists(),
-            "current behaviour: directory contents are destroyed"
+        assert!(dest.is_dir() && !dest.is_symlink(), "real dir must remain");
+        assert_eq!(
+            fs::read_to_string(dest.join("precious.txt")).unwrap(),
+            "do not delete"
         );
         fs::remove_dir_all(&tmp).ok();
     }
 
-    /// Expected: a live foreign symlink in the target (destination outside
-    /// the skills source) is never removed. Observed: the link pass unlinks
-    /// it and plants a source-derived symlink of the same name.
     #[test]
-    fn documents_defect_link_pass_replaces_foreign_symlink() {
+    fn real_target_file_is_fixed() {
+        let tmp = test_temp_dir("clobber-file");
+        let source = tmp.join("skills");
+        fs::create_dir_all(&source).unwrap();
+        test_write_skill(&source, "alpha");
+        let target = tmp.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("alpha"), "real file").unwrap();
+        let raw = format!("[skills]\nsource = {source:?}\ntargets = [{target:?}]\nskip = []\n");
+        let config = test_config_from_toml(&raw);
+
+        sync_skills(&tmp, &config, false).expect("sync");
+
+        let dest = target.join("alpha");
+        assert!(dest.is_file() && !dest.is_symlink());
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "real file");
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn link_pass_leaves_foreign_symlink_is_fixed() {
         let tmp = test_temp_dir("clobber-foreign");
         let source = tmp.join("skills");
         fs::create_dir_all(&source).unwrap();
@@ -1650,21 +1814,14 @@ mod tests {
         let raw = format!("[skills]\nsource = {source:?}\ntargets = [{target:?}]\nskip = []\n");
         let config = test_config_from_toml(&raw);
 
-        sync_skills(&tmp, &config, false);
+        sync_skills(&tmp, &config, false).expect("sync");
 
-        assert_eq!(
-            fs::read_link(target.join("alpha")).unwrap(),
-            source.join("alpha"),
-            "current behaviour: foreign symlink is overwritten with a source link"
-        );
+        assert_eq!(fs::read_link(target.join("alpha")).unwrap(), outside);
         fs::remove_dir_all(&tmp).ok();
     }
 
-    /// Expected: only dangling *managed* links (those that resolved into the
-    /// skills source) are cleaned up. Observed: every dangling symlink in a
-    /// target is deleted, including foreign ones.
     #[test]
-    fn documents_defect_dangling_foreign_symlink_is_deleted() {
+    fn dangling_foreign_symlink_is_fixed() {
         let tmp = test_temp_dir("dangling-foreign");
         let source = tmp.join("skills");
         fs::create_dir_all(&source).unwrap();
@@ -1675,20 +1832,17 @@ mod tests {
         let raw = format!("[skills]\nsource = {source:?}\ntargets = [{target:?}]\nskip = []\n");
         let config = test_config_from_toml(&raw);
 
-        sync_skills(&tmp, &config, false);
+        sync_skills(&tmp, &config, false).expect("sync");
 
         assert!(
-            target.join("ghost").symlink_metadata().is_err(),
-            "current behaviour: dangling foreign symlink is removed"
+            target.join("ghost").symlink_metadata().is_ok(),
+            "dangling foreign symlink must remain"
         );
         fs::remove_dir_all(&tmp).ok();
     }
 
-    /// Expected: README "Symlinks and entries in `skip` are ignored" — a
-    /// symlink in the source tree is not a skill. Observed: `Path::is_dir`
-    /// follows the symlink, so a link to a skill directory is synced too.
     #[test]
-    fn documents_defect_source_symlink_is_treated_as_skill() {
+    fn source_symlink_is_fixed() {
         let tmp = test_temp_dir("src-symlink");
         let source = tmp.join("skills");
         fs::create_dir_all(&source).unwrap();
@@ -1698,21 +1852,16 @@ mod tests {
         let raw = format!("[skills]\nsource = {source:?}\ntargets = [{target:?}]\nskip = []\n");
         let config = test_config_from_toml(&raw);
 
-        let count = sync_skills(&tmp, &config, false);
+        let count = sync_skills(&tmp, &config, false).expect("sync");
 
-        assert_eq!(
-            count, 2,
-            "current behaviour: source symlink counts as a skill"
-        );
-        assert!(target.join("alias").is_symlink());
+        assert_eq!(count, 1, "source symlink must not count as a skill");
+        assert!(target.join("alias").symlink_metadata().is_err());
+        assert!(target.join("alpha").is_symlink());
         fs::remove_dir_all(&tmp).ok();
     }
 
-    /// Expected: rewrite of OpenCode mcp.json preserves sibling keys such as
-    /// `$schema`. Observed: the file is replaced with an object that only
-    /// contains `mcpServers`.
     #[test]
-    fn documents_defect_opencode_write_drops_sibling_keys() {
+    fn opencode_sibling_keys_is_fixed() {
         let tmp = test_temp_dir("oc-clobber");
         let source = tmp.join("mcp-servers.json");
         fs::write(&source, r#"{"mcpServers": {"fs": {"command": "npx"}}}"#).unwrap();
@@ -1726,23 +1875,17 @@ mod tests {
         let codex = tmp.join("codex/config.toml");
         let config = mcp_config(&source, &opencode, &codex);
 
-        sync_mcp(&tmp, &config);
+        sync_mcp(&tmp, &config).expect("mcp");
 
         let oc: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&opencode).unwrap()).unwrap();
-        assert!(
-            oc.get("$schema").is_none(),
-            "current behaviour: sibling keys are dropped"
-        );
+        assert_eq!(oc["$schema"], "https://example.com/schema.json");
         assert_eq!(oc["mcpServers"]["fs"]["command"], "npx");
         fs::remove_dir_all(&tmp).ok();
     }
 
-    /// Expected: a Codex managed-block error rolls back or skips the whole
-    /// MCP step. Observed: OpenCode mcp.json is written first, then the
-    /// function returns, leaving the two consumers out of sync.
     #[test]
-    fn documents_defect_unclosed_codex_block_still_writes_opencode() {
+    fn unclosed_codex_block_is_fixed() {
         let tmp = test_temp_dir("partial-mcp");
         let source = tmp.join("mcp-servers.json");
         fs::write(
@@ -1753,15 +1896,155 @@ mod tests {
         let opencode = tmp.join("opencode/mcp.json");
         let codex = tmp.join("codex/config.toml");
         fs::create_dir_all(codex.parent().unwrap()).unwrap();
-        fs::write(&codex, format!("{MCP_BEGIN}\nno end\n")).unwrap();
+        let original = format!("{MCP_BEGIN}\nno end\n");
+        fs::write(&codex, &original).unwrap();
         let config = mcp_config(&source, &opencode, &codex);
 
-        sync_mcp(&tmp, &config);
-
+        assert!(sync_mcp(&tmp, &config).is_err());
         assert!(
-            opencode.exists(),
-            "current behaviour: OpenCode file is written before the Codex error return"
+            !opencode.exists(),
+            "OpenCode must not be written on Codex error"
         );
+        assert_eq!(fs::read_to_string(&codex).unwrap(), original);
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn skip_prunes_managed_links_is_fixed() {
+        let tmp = test_temp_dir("skip-prune");
+        let source = tmp.join("skills");
+        fs::create_dir_all(&source).unwrap();
+        test_write_skill(&source, "alpha");
+        test_write_skill(&source, "beta");
+        let target = tmp.join("target");
+        let raw = format!("[skills]\nsource = {source:?}\ntargets = [{target:?}]\nskip = []\n");
+        let config = test_config_from_toml(&raw);
+        sync_skills(&tmp, &config, false).expect("sync");
+        assert!(target.join("beta").is_symlink());
+
+        let raw =
+            format!("[skills]\nsource = {source:?}\ntargets = [{target:?}]\nskip = [\"beta\"]\n");
+        let config = test_config_from_toml(&raw);
+        sync_skills(&tmp, &config, false).expect("sync");
+        assert!(
+            target.join("beta").symlink_metadata().is_err(),
+            "skipped skill's managed link must be pruned"
+        );
+        assert!(target.join("alpha").is_symlink());
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn relative_target_is_fixed() {
+        let home = PathBuf::from("/home/user");
+        assert_eq!(
+            expand_tilde("rel-out", &home),
+            PathBuf::from("/home/user/rel-out")
+        );
+        let config = test_config_from_toml("[skills]\ntargets = [\"rel-out\"]\n");
+        let resolved = targets(&config, &home);
+        assert_eq!(resolved[0].path, PathBuf::from("/home/user/rel-out"));
+    }
+
+    #[test]
+    fn bom_frontmatter_is_fixed() {
+        assert!(has_yaml_frontmatter("\u{feff}---\nname: x\n---\n"));
+        assert!(has_yaml_frontmatter("---\nname: x\n---\n"));
+        assert!(!has_yaml_frontmatter("nope"));
+
+        let tmp = test_temp_dir("bom-sync");
+        let source = tmp.join("skills");
+        let skill = source.join("bom");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "\u{feff}---\nname: bom\n---\nbody\n",
+        )
+        .unwrap();
+        let target = tmp.join("target");
+        let raw = format!("[skills]\nsource = {source:?}\ntargets = [{target:?}]\nskip = []\n");
+        let config = test_config_from_toml(&raw);
+        let count = sync_skills(&tmp, &config, false).expect("sync");
+        assert_eq!(count, 1);
+        assert!(target.join("bom").is_symlink());
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn dangling_managed_symlink_is_still_pruned() {
+        let tmp = test_temp_dir("dangling-managed");
+        let source = tmp.join("skills");
+        fs::create_dir_all(&source).unwrap();
+        test_write_skill(&source, "alpha");
+        test_write_skill(&source, "gone");
+        let target = tmp.join("target");
+        let raw = format!("[skills]\nsource = {source:?}\ntargets = [{target:?}]\nskip = []\n");
+        let config = test_config_from_toml(&raw);
+        sync_skills(&tmp, &config, false).expect("sync");
+        fs::remove_dir_all(source.join("gone")).unwrap();
+        sync_skills(&tmp, &config, false).expect("sync");
+        assert!(
+            target.join("gone").symlink_metadata().is_err(),
+            "dangling managed links must still be pruned"
+        );
+        assert!(target.join("alpha").is_symlink());
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn skill_md_directory_is_fixed() {
+        let tmp = test_temp_dir("skill-md-dir");
+        let source = tmp.join("skills");
+        let skill = source.join("dirskill");
+        fs::create_dir_all(skill.join("SKILL.md")).unwrap();
+        fs::write(skill.join("SKILL.md").join("nested"), "nope").unwrap();
+        let target = tmp.join("target");
+        let raw = format!("[skills]\nsource = {source:?}\ntargets = [{target:?}]\nskip = []\n");
+        let config = test_config_from_toml(&raw);
+
+        let count = sync_skills(&tmp, &config, false).expect("sync");
+        assert_eq!(count, 0);
+        assert!(target.join("dirskill").symlink_metadata().is_err());
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn failed_target_is_fixed() {
+        let tmp = test_temp_dir("failed-target");
+        let source = tmp.join("skills");
+        fs::create_dir_all(&source).unwrap();
+        test_write_skill(&source, "alpha");
+        let blocked = tmp.join("blocked");
+        fs::write(&blocked, "not a directory").unwrap();
+        let raw = format!("[skills]\nsource = {source:?}\ntargets = [{blocked:?}]\nskip = []\n");
+        let config = test_config_from_toml(&raw);
+        let err = sync_skills(&tmp, &config, false).unwrap_err();
+        assert!(err.contains("target"), "{err}");
+        assert!(blocked.is_file(), "must not replace a file-shaped target");
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn codex_extras_without_url_is_fixed() {
+        let tmp = test_temp_dir("codex-no-url");
+        let source = tmp.join("mcp-servers.json");
+        fs::write(
+            &source,
+            r#"{"mcpServers": {"fs": {"command": "npx"}}, "_codexExtras": {"broken": {"command": "npx"}}}"#,
+        )
+        .unwrap();
+        let opencode = tmp.join("opencode/mcp.json");
+        let codex = tmp.join("codex/config.toml");
+        let config = mcp_config(&source, &opencode, &codex);
+
+        sync_mcp(&tmp, &config).expect("mcp");
+
+        let oc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&opencode).unwrap()).unwrap();
+        assert_eq!(oc["mcpServers"]["fs"]["command"], "npx");
+        let cx = fs::read_to_string(&codex).unwrap();
+        assert!(cx.contains(MCP_BEGIN));
+        assert!(!cx.contains("broken"));
         fs::remove_dir_all(&tmp).ok();
     }
 }
