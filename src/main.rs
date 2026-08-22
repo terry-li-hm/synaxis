@@ -308,6 +308,8 @@ fn is_skill_directory(item: &Path) -> bool {
 
 /// Whether `link` is a synaxis-managed symlink into `source_dir`.
 /// Uses the link text so dangling managed links still classify.
+/// Canonicalizes both sides so macOS tempdirs (`/var` → `/private/var`) match
+/// even when the link target itself is missing.
 fn is_managed_symlink(link: &Path, source_dir: &Path) -> bool {
     let Ok(target) = fs::read_link(link) else {
         return false;
@@ -320,10 +322,18 @@ fn is_managed_symlink(link: &Path, source_dir: &Path) -> bool {
             None => target,
         }
     };
-    if let Ok(dest) = fs::canonicalize(&resolved) {
-        return dest.starts_with(source_dir);
-    }
-    resolved.starts_with(source_dir)
+    let source = fs::canonicalize(source_dir).unwrap_or_else(|_| source_dir.to_path_buf());
+    let dest = match fs::canonicalize(&resolved) {
+        Ok(dest) => dest,
+        Err(_) => match (resolved.parent(), resolved.file_name()) {
+            (Some(parent), Some(name)) => match fs::canonicalize(parent) {
+                Ok(parent) => parent.join(name),
+                Err(_) => resolved,
+            },
+            _ => resolved,
+        },
+    };
+    dest.starts_with(&source)
 }
 
 fn sync_skills(home: &Path, config: &Config, dry_run: bool) -> Result<usize, String> {
